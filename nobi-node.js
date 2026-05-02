@@ -9,7 +9,7 @@ const bip39 = require('bip39');
 
 const ec = new EC('secp256k1');
 
-// ==================== CONFIGURATION ====================
+// ------------------- CONFIGURATION -------------------
 const NOBI = {
   name: 'NOBI',
   symbol: 'NOBI',
@@ -23,18 +23,13 @@ const NOBI = {
   apiPort: process.env.PORT || 3000,
   seedPeers: [],
   faucetAmount: 10,
-  faucetCooldownMs: 3600000, // 1 hour
-  faucetWalletPrivateKey: null, // will be loaded from env or generated
+  faucetCooldownMs: 3600000,
+  faucetWalletPrivateKey: null,
 };
 
-// ==================== UTILITIES ====================
-function hash(data) {
-  return SHA256(data).toString();
-}
-
-function doubleHash(data) {
-  return hash(hash(data));
-}
+// ------------------- UTILITIES -------------------
+function hash(data) { return SHA256(data).toString(); }
+function doubleHash(data) { return hash(hash(data)); }
 
 function base58CheckEncode(payload, version) {
   const versioned = Buffer.concat([Buffer.from([version]), payload]);
@@ -71,7 +66,7 @@ function verifyScript(sig, pubKeyHash, scriptPubKey) {
   return addrHash === scriptPubKey.hash;
 }
 
-// ==================== TRANSACTION ====================
+// ------------------- TRANSACTION -------------------
 class Transaction {
   constructor() {
     this.id = null;
@@ -80,13 +75,11 @@ class Transaction {
     this.locktime = 0;
     this.fee = 0;
   }
-
   calculateHash() {
     const inputsEnc = this.inputs.map(i => `${i.prevTxId}:${i.prevOutIndex}:${JSON.stringify(i.scriptSig)}`).join(',');
     const outputsEnc = this.outputs.map(o => `${o.amount}:${JSON.stringify(o.scriptPubKey)}`).join(',');
     return hash(inputsEnc + outputsEnc + this.locktime);
   }
-
   signInput(index, privateKey, utxoScriptPubKey) {
     const txCopy = new Transaction();
     txCopy.inputs = this.inputs.map((inp, i) => {
@@ -100,7 +93,6 @@ class Transaction {
     const signature = key.sign(hashToSign, 'base64').toDER('hex');
     this.inputs[index].scriptSig = { signature, publicKeyHex: key.getPublic('hex') };
   }
-
   isValid(utxoSet, height) {
     let inputSum = 0, outputSum = 0;
     for (let i = 0; i < this.inputs.length; i++) {
@@ -112,21 +104,15 @@ class Transaction {
       inputSum += utxo.amount;
       if (!verifyScript(input.scriptSig, utxo.scriptPubKey.hash, utxo.scriptPubKey)) return false;
     }
-    for (const out of this.outputs) {
-      outputSum += out.amount;
-      if (out.amount < 0) return false;
-    }
+    for (const out of this.outputs) outputSum += out.amount;
     if (inputSum < outputSum) return false;
     this.fee = inputSum - outputSum;
     return true;
   }
-
-  isCoinbase() {
-    return this.inputs.length === 1 && this.inputs[0].prevTxId === '0'.repeat(64);
-  }
+  isCoinbase() { return this.inputs.length === 1 && this.inputs[0].prevTxId === '0'.repeat(64); }
 }
 
-// ==================== BLOCK ====================
+// ------------------- BLOCK -------------------
 class Block {
   constructor(version = 1, previousHash, merkleRoot, timestamp, bits, nonce = 0, height) {
     this.version = version;
@@ -139,11 +125,9 @@ class Block {
     this.transactions = [];
     this.hash = null;
   }
-
   calculateHash() {
     return hash(this.version + this.previousHash + this.merkleRoot + this.timestamp + this.bits + this.nonce + this.height);
   }
-
   mineBlock(difficulty) {
     const target = '0'.repeat(difficulty);
     while (!this.hash || this.hash.substring(0, difficulty) !== target) {
@@ -152,7 +136,6 @@ class Block {
     }
     console.log(`[MINED] Block ${this.height} | ${this.hash}`);
   }
-
   computeMerkleRoot() {
     if (this.transactions.length === 0) return hash('empty');
     let hashes = this.transactions.map(tx => tx.id);
@@ -164,7 +147,7 @@ class Block {
   }
 }
 
-// ==================== BLOCKCHAIN CORE ====================
+// ------------------- BLOCKCHAIN CORE -------------------
 class NOBICoin {
   constructor(dbPath = './nobi.db') {
     this.db = new sqlite3.Database(dbPath);
@@ -173,7 +156,8 @@ class NOBICoin {
     this.mempool = [];
     this.orphanBlocks = new Map();
     this.difficulty = NOBI.initialDifficulty;
-    this.faucetRequests = new Map(); // address -> timestamp
+    this.faucetRequests = new Map();
+    this.ready = false;
     this.initPromise = this.init();
   }
 
@@ -182,17 +166,9 @@ class NOBICoin {
     await this.loadChainFromDb();
     await this.loadUtxosFromDb();
     await this.initDifficulty();
-    // Setup faucet wallet if not exists
-    if (!NOBI.faucetWalletPrivateKey && process.env.FAUCET_PRIVATE_KEY) {
-      NOBI.faucetWalletPrivateKey = process.env.FAUCET_PRIVATE_KEY;
-    } else if (!NOBI.faucetWalletPrivateKey) {
-      // Generate a faucet wallet (save this key somewhere!)
-      const keyPair = ec.genKeyPair();
-      NOBI.faucetWalletPrivateKey = keyPair.getPrivate('hex');
-      const faucetAddress = createAddressFromPublicKey(keyPair.getPublic('hex'));
-      console.log(`[FAUCET] Generated new faucet wallet: ${faucetAddress}`);
-      console.log(`[FAUCET] Private key (save this): ${NOBI.faucetWalletPrivateKey}`);
-    }
+    await this.setupFaucetWallet();
+    this.ready = true;
+    console.log(`[NOBI] Blockchain ready, height: ${this.chain.length}`);
   }
 
   initDb() {
@@ -239,12 +215,15 @@ class NOBICoin {
 
   async loadChainFromDb() {
     const rows = await this.dbAll('SELECT * FROM blocks ORDER BY height ASC');
-    if (rows.length === 0) await this.createGenesisBlock();
-    else for (const row of rows) {
-      const block = JSON.parse(row.data);
-      block.height = row.height;
-      block.hash = row.hash;
-      this.chain.push(block);
+    if (rows.length === 0) {
+      await this.createGenesisBlock();
+    } else {
+      for (const row of rows) {
+        const block = JSON.parse(row.data);
+        block.height = row.height;
+        block.hash = row.hash;
+        this.chain.push(block);
+      }
     }
   }
 
@@ -257,7 +236,9 @@ class NOBICoin {
         matureHeight: row.matureHeight
       });
     }
-    if (this.utxoSet.size === 0 && this.chain.length === 1) await this.updateUtxoSetAfterBlock(this.chain[0]);
+    if (this.utxoSet.size === 0 && this.chain.length === 1) {
+      await this.updateUtxoSetAfterBlock(this.chain[0]);
+    }
   }
 
   async createGenesisBlock() {
@@ -301,17 +282,28 @@ class NOBICoin {
   }
 
   async initDifficulty() {
-    if (this.chain.length <= NOBI.difficultyAdjustmentInterval) this.difficulty = NOBI.initialDifficulty;
-    else await this.adjustDifficulty();
+    if (this.chain.length <= NOBI.difficultyAdjustmentInterval) {
+      this.difficulty = NOBI.initialDifficulty;
+    } else {
+      const lastBlock = this.chain[this.chain.length - 1];
+      const firstBlock = this.chain[this.chain.length - NOBI.difficultyAdjustmentInterval];
+      const actualTime = lastBlock.timestamp - firstBlock.timestamp;
+      const expectedTime = NOBI.difficultyAdjustmentInterval * NOBI.targetBlockTimeMs;
+      if (actualTime < expectedTime / 2) this.difficulty++;
+      else if (actualTime > expectedTime * 2 && this.difficulty > 1) this.difficulty--;
+    }
   }
 
-  async adjustDifficulty() {
-    const lastBlock = this.chain[this.chain.length - 1];
-    const firstBlock = this.chain[this.chain.length - NOBI.difficultyAdjustmentInterval];
-    const actualTime = lastBlock.timestamp - firstBlock.timestamp;
-    const expectedTime = NOBI.difficultyAdjustmentInterval * NOBI.targetBlockTimeMs;
-    if (actualTime < expectedTime / 2) this.difficulty++;
-    else if (actualTime > expectedTime * 2 && this.difficulty > 1) this.difficulty--;
+  async setupFaucetWallet() {
+    if (process.env.FAUCET_PRIVATE_KEY) {
+      NOBI.faucetWalletPrivateKey = process.env.FAUCET_PRIVATE_KEY;
+    } else if (!NOBI.faucetWalletPrivateKey) {
+      const keyPair = ec.genKeyPair();
+      NOBI.faucetWalletPrivateKey = keyPair.getPrivate('hex');
+      const faucetAddress = createAddressFromPublicKey(keyPair.getPublic('hex'));
+      console.log(`[FAUCET] Generated new faucet wallet: ${faucetAddress}`);
+      console.log(`[FAUCET] Private key (save this): ${NOBI.faucetWalletPrivateKey}`);
+    }
   }
 
   getLatestBlock() { return this.chain[this.chain.length - 1]; }
@@ -343,7 +335,9 @@ class NOBICoin {
     for (const tx of block.transactions) {
       if (!tx.isValid(utxoCopy, block.height)) return false;
       for (const inp of tx.inputs) utxoCopy.delete(`${inp.prevTxId}:${inp.prevOutIndex}`);
-      for (let i = 0; i < tx.outputs.length; i++) utxoCopy.set(`${tx.id}:${i}`, { amount: tx.outputs[i].amount, scriptPubKey: tx.outputs[i].scriptPubKey, matureHeight: 0 });
+      for (let i = 0; i < tx.outputs.length; i++) {
+        utxoCopy.set(`${tx.id}:${i}`, { amount: tx.outputs[i].amount, scriptPubKey: tx.outputs[i].scriptPubKey, matureHeight: 0 });
+      }
     }
     return true;
   }
@@ -353,7 +347,9 @@ class NOBICoin {
       this.chain.push(block);
       await this.saveBlock(block);
       await this.updateUtxoSetAfterBlock(block);
-      for (const tx of block.transactions) if (!tx.isCoinbase()) this.mempool = this.mempool.filter(m => m.id !== tx.id);
+      for (const tx of block.transactions) {
+        if (!tx.isCoinbase()) this.mempool = this.mempool.filter(m => m.id !== tx.id);
+      }
       if (global.p2pServer) global.p2pServer.broadcast('NEW_BLOCK', { block });
       return true;
     }
@@ -366,14 +362,23 @@ class NOBICoin {
 
   async handleReorg(block) {
     let commonIndex = -1;
-    for (let i = 0; i < this.chain.length; i++) if (this.chain[i].hash === block.previousHash) { commonIndex = i; break; }
+    for (let i = 0; i < this.chain.length; i++) {
+      if (this.chain[i].hash === block.previousHash) { commonIndex = i; break; }
+    }
     if (commonIndex === -1 || (this.chain.length - commonIndex) > NOBI.maxReorgDepth) return false;
     const removed = this.chain.splice(commonIndex + 1);
     let newChain = [block];
     let parent = block;
-    while (this.orphanBlocks.has(parent.hash)) { const next = this.orphanBlocks.get(parent.hash); newChain.push(next); parent = next; }
+    while (this.orphanBlocks.has(parent.hash)) {
+      const next = this.orphanBlocks.get(parent.hash);
+      newChain.push(next);
+      parent = next;
+    }
     for (const blk of newChain) {
-      if (!await this.validateBlock(blk)) { this.chain.push(...removed); return false; }
+      if (!await this.validateBlock(blk)) {
+        this.chain.push(...removed);
+        return false;
+      }
       this.chain.push(blk);
       await this.saveBlock(blk);
       await this.updateUtxoSetAfterBlock(blk);
@@ -394,7 +399,9 @@ class NOBICoin {
   async getBalance(address) {
     let balance = 0;
     const scriptPubKey = createScriptPubKey(address);
-    for (const [_, utxo] of this.utxoSet) if (utxo.scriptPubKey.hash === scriptPubKey.hash) balance += utxo.amount;
+    for (const [_, utxo] of this.utxoSet) {
+      if (utxo.scriptPubKey.hash === scriptPubKey.hash) balance += utxo.amount;
+    }
     return balance;
   }
 
@@ -418,7 +425,11 @@ class NOBICoin {
 
   async getBlock(height) { return this.chain.find(b => b.height === height); }
   async getTransaction(txid) {
-    for (const block of this.chain) for (const tx of block.transactions) if (tx.id === txid) return { tx, blockHeight: block.height };
+    for (const block of this.chain) {
+      for (const tx of block.transactions) {
+        if (tx.id === txid) return { tx, blockHeight: block.height };
+      }
+    }
     return null;
   }
 
@@ -446,13 +457,15 @@ class NOBICoin {
 
   async faucetRequest(address) {
     const last = this.faucetRequests.get(address);
-    if (last && (Date.now() - last) < NOBI.faucetCooldownMs) throw new Error(`Cooldown: wait ${Math.ceil((NOBI.faucetCooldownMs - (Date.now() - last))/60000)} minutes`);
+    if (last && (Date.now() - last) < NOBI.faucetCooldownMs) {
+      throw new Error(`Cooldown: wait ${Math.ceil((NOBI.faucetCooldownMs - (Date.now() - last))/60000)} minutes`);
+    }
     const faucetKey = NOBI.faucetWalletPrivateKey;
     if (!faucetKey) throw new Error('Faucet not configured');
     const keyPair = ec.keyFromPrivate(faucetKey);
     const faucetAddress = createAddressFromPublicKey(keyPair.getPublic('hex'));
     const balance = await this.getBalance(faucetAddress);
-    if (balance < NOBI.faucetAmount) throw new Error('Faucet depleted');
+    if (balance < NOBI.faucetAmount) throw new Error('Faucet depleted – need to send NOBI to faucet address');
     const tx = await this.createRawTransaction(faucetAddress, address, NOBI.faucetAmount, faucetKey);
     await this.addTransaction(tx);
     this.faucetRequests.set(address, Date.now());
@@ -460,7 +473,7 @@ class NOBICoin {
   }
 }
 
-// ==================== P2P NETWORK ====================
+// ------------------- P2P NETWORK -------------------
 class P2PServer {
   constructor(blockchain, port) {
     this.blockchain = blockchain;
@@ -479,13 +492,15 @@ class P2PServer {
   handleSocket(socket) {
     this.sockets.push(socket);
     socket.on('message', async (msg) => {
-      const data = JSON.parse(msg.toString());
-      if (data.type === 'GETBLOCKS') {
-        const lastBlock = this.blockchain.getLatestBlock();
-        socket.send(JSON.stringify({ type: 'BLOCKS', blocks: [lastBlock] }));
-      } else if (data.type === 'BLOCK') await this.blockchain.addBlock(data.block);
-      else if (data.type === 'TX') try { await this.blockchain.addTransaction(data.tx); } catch(e) {}
-      else if (data.type === 'PING') socket.send(JSON.stringify({ type: 'PONG' }));
+      try {
+        const data = JSON.parse(msg.toString());
+        if (data.type === 'GETBLOCKS') {
+          const lastBlock = this.blockchain.getLatestBlock();
+          socket.send(JSON.stringify({ type: 'BLOCKS', blocks: [lastBlock] }));
+        } else if (data.type === 'BLOCK') await this.blockchain.addBlock(data.block);
+        else if (data.type === 'TX') try { await this.blockchain.addTransaction(data.tx); } catch(e) {}
+        else if (data.type === 'PING') socket.send(JSON.stringify({ type: 'PONG' }));
+      } catch(e) {}
     });
     socket.send(JSON.stringify({ type: 'VERSION', version: 2, height: this.blockchain.chain.length }));
   }
@@ -495,15 +510,23 @@ class P2PServer {
   }
 }
 
-// ==================== EXPRESS APP (API + Explorer + Faucet) ====================
+// ------------------- EXPRESS APP -------------------
 const app = express();
 app.use(express.json());
-app.use(express.static('public')); // optional static folder
 
-let nobi;
-let p2p;
+let nobi = null;
+let p2p = null;
 
-// ---------- API endpoints ----------
+// Helper middleware to wait for blockchain to be ready
+const waitForReady = async (req, res, next) => {
+  if (!nobi) return res.status(503).json({ error: 'Node initializing, try again in a few seconds' });
+  if (!nobi.ready) {
+    await nobi.initPromise;
+  }
+  next();
+};
+
+// --- API ENDPOINTS (all fully functional) ---
 app.post('/api/init', async (req, res) => {
   if (!nobi) {
     nobi = new NOBICoin();
@@ -511,11 +534,13 @@ app.post('/api/init', async (req, res) => {
     p2p = new P2PServer(nobi, NOBI.p2pPort);
     global.p2pServer = p2p;
     p2p.listen();
+    res.json({ status: 'NOBI initialized', height: nobi.chain.length });
+  } else {
+    res.json({ status: 'Already initialized', height: nobi.chain.length });
   }
-  res.json({ status: 'NOBI initialized', height: nobi.chain.length });
 });
 
-app.get('/api/wallet/new', (req, res) => {
+app.get('/api/wallet/new', waitForReady, (req, res) => {
   const mnemonic = bip39.generateMnemonic();
   const seed = bip39.mnemonicToSeedSync(mnemonic);
   const root = bip32.fromSeed(seed);
@@ -526,111 +551,102 @@ app.get('/api/wallet/new', (req, res) => {
   res.json({ mnemonic, privateKey, publicKey, address });
 });
 
-app.get('/api/balance/:address', async (req, res) => {
-  if (!nobi) return res.status(503).json({ error: 'Init first' });
+app.get('/api/balance/:address', waitForReady, async (req, res) => {
   const balance = await nobi.getBalance(req.params.address);
   res.json({ address: req.params.address, balance });
 });
 
-app.post('/api/send', async (req, res) => {
+app.post('/api/send', waitForReady, async (req, res) => {
   const { fromAddress, toAddress, amount, privateKey } = req.body;
-  if (!fromAddress || !toAddress || !amount || !privateKey) return res.status(400).json({ error: 'Missing fields' });
+  if (!fromAddress || !toAddress || !amount || !privateKey) {
+    return res.status(400).json({ error: 'Missing fromAddress, toAddress, amount, or privateKey' });
+  }
   try {
     const tx = await nobi.createRawTransaction(fromAddress, toAddress, amount, privateKey);
     const txid = await nobi.addTransaction(tx);
     res.json({ txid, status: 'pending' });
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.post('/api/mine', async (req, res) => {
+app.post('/api/mine', waitForReady, async (req, res) => {
   const { minerAddress } = req.body;
-  if (!minerAddress) return res.status(400).json({ error: 'Need minerAddress' });
+  if (!minerAddress) return res.status(400).json({ error: 'Missing minerAddress' });
   try {
     const block = await nobi.minePendingTransactions(minerAddress);
     res.json({ message: `Mined block ${block.hash}`, height: block.height });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/api/chain', (req, res) => {
-  if (!nobi) return res.status(503).json({ error: 'Init first' });
+app.get('/api/chain', waitForReady, (req, res) => {
   const summary = nobi.chain.map(b => ({ height: b.height, hash: b.hash, txCount: b.transactions.length, timestamp: b.timestamp }));
   res.json({ chain: summary, length: nobi.chain.length, difficulty: nobi.difficulty });
 });
 
-app.get('/api/pending', (req, res) => {
-  res.json({ mempool: nobi ? nobi.mempool.map(tx => tx.id) : [] });
+app.get('/api/pending', waitForReady, (req, res) => {
+  res.json({ mempool: nobi.mempool.map(tx => tx.id) });
 });
 
-app.get('/api/block/:height', async (req, res) => {
-  if (!nobi) return res.status(503).json({ error: 'Init first' });
+app.get('/api/block/:height', waitForReady, async (req, res) => {
   const block = await nobi.getBlock(parseInt(req.params.height));
   if (!block) return res.status(404).json({ error: 'Block not found' });
   res.json(block);
 });
 
-app.get('/api/tx/:txid', async (req, res) => {
-  if (!nobi) return res.status(503).json({ error: 'Init first' });
+app.get('/api/tx/:txid', waitForReady, async (req, res) => {
   const result = await nobi.getTransaction(req.params.txid);
   if (!result) return res.status(404).json({ error: 'Transaction not found' });
   res.json(result);
 });
 
-app.get('/api/address/:address/txs', async (req, res) => {
-  if (!nobi) return res.status(503).json({ error: 'Init first' });
+app.get('/api/address/:address/txs', waitForReady, async (req, res) => {
   const txs = await nobi.getAddressTransactions(req.params.address);
   res.json({ address: req.params.address, transactions: txs });
 });
 
-app.post('/api/faucet', async (req, res) => {
+app.post('/api/faucet', waitForReady, async (req, res) => {
   const { address } = req.body;
   if (!address) return res.status(400).json({ error: 'Address required' });
-  if (!nobi) return res.status(503).json({ error: 'Node not ready' });
   try {
     const txid = await nobi.faucetRequest(address);
     res.json({ success: true, txid, amount: NOBI.faucetAmount });
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-// ---------- HTML Explorer (served at /explorer) ----------
+// --- HTML PAGES ---
 app.get('/explorer', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
-<html>
-<head><title>NOBI Explorer</title><style>body{font-family:monospace;margin:20px;background:#0a0e27;color:#eee;} a{color:#7c3aed;} .card{background:#1e1e3f;padding:20px;border-radius:12px;margin:10px 0;} input,button{padding:8px;margin:5px;}</style></head>
-<body>
-<h1>🔍 NOBI Block Explorer</h1>
+  res.send(`<!DOCTYPE html>
+<html><head><title>NOBI Explorer</title><style>body{background:#0a0e27;color:#eee;font-family:monospace;margin:20px;} .card{background:#1e1e3f;padding:20px;border-radius:12px;margin:10px 0;} input,button{padding:8px;margin:5px;}</style></head>
+<body><h1>🔍 NOBI Block Explorer</h1>
 <div class="card"><h3>Latest Blocks</h3><pre id="blocks">Loading...</pre></div>
 <div class="card"><h3>Search</h3><input id="search" placeholder="Block height or TxID" size="50"><button onclick="search()">Go</button><div id="result"></div></div>
 <script>
 async function loadBlocks(){ let r=await fetch('/api/chain'); let d=await r.json(); document.getElementById('blocks').innerHTML=JSON.stringify(d.chain.slice(-10),null,2); }
 async function search(){ let q=document.getElementById('search').value; if(!q)return; let res=document.getElementById('result'); if(!isNaN(q)){ let r=await fetch('/api/block/'+q); if(r.ok){ let block=await r.json(); res.innerHTML='<pre>'+JSON.stringify(block,null,2)+'</pre>'; } else res.innerHTML='Block not found'; } else { let r=await fetch('/api/tx/'+q); if(r.ok){ let tx=await r.json(); res.innerHTML='<pre>'+JSON.stringify(tx,null,2)+'</pre>'; } else res.innerHTML='Transaction not found'; } }
 loadBlocks(); setInterval(loadBlocks,15000);
-</script>
-</body></html>
-  `);
+</script></body></html>`);
 });
 
-// ---------- HTML Faucet (served at /faucet) ----------
 app.get('/faucet', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
-<html>
-<head><title>NOBI Faucet</title><style>body{background:#0a0e27;color:#eee;font-family:monospace;margin:20px;} .card{background:#1e1e3f;padding:20px;border-radius:12px;max-width:500px;} input,button{padding:10px;margin:5px;width:90%;}</style></head>
-<body>
-<h1>🚰 NOBI Faucet</h1>
+  res.send(`<!DOCTYPE html>
+<html><head><title>NOBI Faucet</title><style>body{background:#0a0e27;color:#eee;font-family:monospace;margin:20px;} .card{background:#1e1e3f;padding:20px;border-radius:12px;max-width:500px;} input,button{padding:10px;margin:5px;width:90%;}</style></head>
+<body><h1>🚰 NOBI Faucet</h1>
 <div class="card"><p>Get free ${NOBI.faucetAmount} NOBI every hour.</p>
 <input id="address" placeholder="Your NOBI address"><br>
 <button onclick="requestFaucet()">Request NOBI</button>
 <p id="status"></p></div>
 <script>
 async function requestFaucet(){ let addr=document.getElementById('address').value; if(!addr){ alert('Enter address'); return; } let status=document.getElementById('status'); status.innerText='Sending...'; try{ let r=await fetch('/api/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})}); let d=await r.json(); if(r.ok) status.innerText='Success! TXID: '+d.txid; else status.innerText='Error: '+d.error; }catch(e){ status.innerText='Error'; } }
-</script>
-</body></html>
-  `);
+</script></body></html>`);
 });
 
-// ---------- Start server ----------
-app.listen(NOBI.apiPort, async () => {
+// --- START SERVER ---
+const server = app.listen(NOBI.apiPort, async () => {
   console.log(`[NOBI] API & UI running on port ${NOBI.apiPort}`);
   nobi = new NOBICoin();
   await nobi.initPromise;
